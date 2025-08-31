@@ -9,12 +9,12 @@ Currently supports **Philips WiZ bulbs**, tested on **Windows** and **macOS (M1)
 ## 🚀 Installation & Setup
 
 ### 1. Clone the repo
-git clone https://github.com/one-adnan/ambient-setup
-cd ambient-setup
+`git clone https://github.com/one-adnan/ambient-setup`  
+`cd ambient-setup`
 
 ### 2. Install dependencies
 Make sure you have Python **3.9+** installed.  
-pip install -r requirements.txt  
+`pip install -r requirements.txt`
 
 ### 3. Find your bulb’s IP
 - Open your router’s admin panel or use a network scanner.  
@@ -54,7 +54,7 @@ Each **mode** can override defaults in the `TWEAKS` section and better to tweak 
 
 Simply run:  
 `python ambient.py`  
-or for Mac/Linux
+Or on Mac/Linux:  
 `python3 ambient.py`  
 
 Stop anytime with `Ctrl+C`.
