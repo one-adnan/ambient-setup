@@ -1,63 +1,25 @@
-import socket, json, time
-from PIL import ImageGrab, Image
+"""
+Ambilight (mss + numpy) - optimized, mode-aware, cross-platform (windows,mac & linux supported).
+Usage:
+    python ambient.py            # uses MODE default in file
+    python ambient.py --mode movie
+"""
+
+import socket
+import json
+import time
+import argparse
+import os
 import colorsys
 
+import mss
+import numpy as np
+
+# -------------------
+# Networking / bulb
+# -------------------
 BULB_IP = "192.168.X.X"   # <-- set your smart bulb's IP
-PORT = 38899 
-
-# -------------------
-# Modes
-# -------------------
-class Modes:
-    AMBIENT = "ambient"
-    GAMING = "gaming"
-    MOVIE = "movie"
-
-# -------------------
-# Global Tunables (defaults), for tweaking its better to modify below in Overrides
-# -------------------
-CAPTURE_W, CAPTURE_H = 60, 34     # downscale for speed
-FRAME_DELAY_SEC = 0.08            # ~12.5 fps
-SAT_BOOST = 1.2                  # gentle saturation lift
-EMA_ALPHA = 0.65                  # 0..1 ; higher = smoother/slower
-
-# Optional extra lift for yellow/green where bulbs often look dull
-HUE_BOOST_RANGE = (0.12, 0.45)    # ~43°..162°
-HUE_RANGE_SAT_MULT = 1.12
-
-# Per-channel gain to fix color casts (e.g. red → pink correction)
-GAIN_R, GAIN_G, GAIN_B = 1.1, 1.0, 1.05
-
-# -------------------
-# Overrides (tweak here)
-# -------------------
-TWEAKS = {
-    Modes.AMBIENT: {
-        "FRAME_DELAY_SEC": 0.08,
-        "EMA_ALPHA": 0.65,
-    },
-    Modes.GAMING: {
-        "FRAME_DELAY_SEC": 0.03, # ~30 fps
-        "EMA_ALPHA": 0.30,   # more reactive
-        "CAPTURE_W": 40,     # focus smaller area for responsiveness
-        "CAPTURE_H": 22,
-    },
-    Modes.MOVIE: {
-        "FRAME_DELAY_SEC": 0.08,
-        "EMA_ALPHA": 0.65,   # smoother like ambient
-        "SAT_BOOST": 1.1,    # slightly toned down for natural colors
-    },
-}
-
-# -------------------
-# Active mode selection
-# -------------------
-MODE = Modes.GAMING
-
-def get_tunable(name):
-    """Get effective value for current mode, falling back to global."""
-    return TWEAKS.get(MODE, {}).get(name, globals()[name])
-
+PORT = 38899
 
 def send_wiz_color(r, g, b, brightness=255):
     msg = {"method":"setState","id":1,
@@ -68,131 +30,255 @@ def send_wiz_color(r, g, b, brightness=255):
     finally:
         sock.close()
 
-# sRGB <-> linear helpers (0..1)
+# -------------------
+# Modes & tunables
+# -------------------
+class Modes:
+    AMBIENT = "ambient"
+    GAMING = "gaming"
+    MOVIE = "movie"
+
+# Global defaults
+CAPTURE_W, CAPTURE_H = 60, 34     # base downscale for ambient/movie
+FRAME_DELAY_SEC = 0.08            # ~12.5 fps default
+SAT_BOOST = 1.2
+EMA_ALPHA = 0.65
+
+HUE_BOOST_RANGE = (0.12, 0.45)
+HUE_RANGE_SAT_MULT = 1.12
+
+GAIN_R, GAIN_G, GAIN_B = 1.1, 1.0, 1.05
+
+# Per-mode overrides
+TWEAKS = {
+    Modes.AMBIENT: {
+        "FRAME_DELAY_SEC": 0.08,
+        "EMA_ALPHA": 0.65,
+        "CAPTURE_W": 60,
+        "CAPTURE_H": 34,
+    },
+    Modes.GAMING: {
+        "FRAME_DELAY_SEC": 0.03, # faster updates
+        "EMA_ALPHA": 0.30,       # final smoothing on 0-255
+        "CAPTURE_W": 16,        # coarse grid -> more reactive
+        "CAPTURE_H": 16,
+        # additional internal tuning applied in code: coarse sampling + temporal boost
+    },
+    Modes.MOVIE: {
+        "FRAME_DELAY_SEC": 0.08,
+        "EMA_ALPHA": 0.65,
+        "CAPTURE_W": 48,
+        "CAPTURE_H": 28,
+        "SAT_BOOST": 1.1,
+    },
+}
+
+# -------------------
+# Helpers
+# -------------------
+def get_tunable(name, mode):
+    return TWEAKS.get(mode, {}).get(name, globals()[name])
+
+# Vectorized sRGB <-> linear conversion (works on scalars & arrays)
 def srgb_to_linear(c):
-    return c/12.92 if c <= 0.04045 else ((c+0.055)/1.055) ** 2.4
+    c = np.asarray(c)
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 def linear_to_srgb(c):
-    return 12.92*c if c <= 0.0031308 else 1.055*(c ** (1/2.4)) - 0.055
+    c = np.asarray(c)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1/2.4)) - 0.055)
 
-def get_screen_avg_rgb(mode=Modes.AMBIENT):
-    cap_w = get_tunable("CAPTURE_W")
-    cap_h = get_tunable("CAPTURE_H")
-    if mode == Modes.GAMING:
-        # Focus on center 25% patch only, more reactive
-        # TODO: works perfect, need to test on cp2077 police siren lights reflection
-        sw, sh = ImageGrab.grab().size
-        left = int(sw*0.375); top = int(sh*0.375)
-        right = int(sw*0.625); bottom = int(sh*0.625)
-        region=(left, top, right, bottom)
-        img = ImageGrab.grab(bbox=region).resize((cap_w, cap_h), Image.BILINEAR).convert("RGB")
-        pixels = img.getdata()
-        
-        r_lin = g_lin = b_lin = 0.0
-        n = 0
-        for r, g, b in pixels:
-            r_lin += srgb_to_linear(r/255.0)
-            g_lin += srgb_to_linear(g/255.0)
-            b_lin += srgb_to_linear(b/255.0)
-            n += 1
+# Postprocess linear averages -> final 0..255 rgb and brightness v
+def postprocess_from_linear(r_lin, g_lin, b_lin, mode):
+    # r_lin/g_lin/b_lin are scalars in [0..1] linear space
+    # Convert to sRGB
+    r = float(linear_to_srgb(r_lin)); r = max(0.0, min(1.0, r))
+    g = float(linear_to_srgb(g_lin)); g = max(0.0, min(1.0, g))
+    b = float(linear_to_srgb(b_lin)); b = max(0.0, min(1.0, b))
 
-        r_lin /= n; g_lin /= n; b_lin /= n
-
-    elif mode == Modes.MOVIE:
-        # Weighted average: center contributes more, edges less
-        img = ImageGrab.grab().resize((cap_w, cap_h), Image.BILINEAR).convert("RGB")
-        pixels = img.load()
-
-        r_lin = g_lin = b_lin = 0.0
-        total_weight = 0.0
-        cx, cy = cap_w // 2, cap_h // 2
-        max_dist = (cx**2 + cy**2) ** 0.5
-
-        for y in range(cap_h):
-            for x in range(cap_w):
-                r, g, b = pixels[x, y]
-                dx, dy = x - cx, y - cy
-                dist = (dx*dx + dy*dy) ** 0.5
-                w = 1.5 - (dist / max_dist)  # center ~1.5, edges ~0
-                if w < 0: w = 0
-                r_lin += srgb_to_linear(r/255.0) * w
-                g_lin += srgb_to_linear(g/255.0) * w
-                b_lin += srgb_to_linear(b/255.0) * w
-                total_weight += w
-
-        r_lin /= total_weight; g_lin /= total_weight; b_lin /= total_weight
-
-    else:  # ambient (full-screen average)
-        img = ImageGrab.grab().resize((cap_w, cap_h), Image.BILINEAR).convert("RGB")
-        pixels = img.getdata()
-
-        r_lin = g_lin = b_lin = 0.0
-        n = 0
-        for r, g, b in pixels:
-            r_lin += srgb_to_linear(r/255.0)
-            g_lin += srgb_to_linear(g/255.0)
-            b_lin += srgb_to_linear(b/255.0)
-            n += 1
-        r_lin /= n; g_lin /= n; b_lin /= n
-
-    # Back to sRGB
-    r = max(0.0, min(1.0, linear_to_srgb(r_lin)))
-    g = max(0.0, min(1.0, linear_to_srgb(g_lin)))
-    b = max(0.0, min(1.0, linear_to_srgb(b_lin)))
-
-    # HSV tweak: saturation + optional hue range boost
+    # HSV tweak
     h, s, v = colorsys.rgb_to_hsv(r, g, b)
-    s *= get_tunable("SAT_BOOST")
-    hue_boost_range = get_tunable("HUE_BOOST_RANGE")
-    hue_range_sat_mult = get_tunable("HUE_RANGE_SAT_MULT")
+    s *= get_tunable("SAT_BOOST", mode)
+    hue_boost_range = get_tunable("HUE_BOOST_RANGE", mode)
+    hue_range_sat_mult = get_tunable("HUE_RANGE_SAT_MULT", mode)
     if hue_boost_range[0] <= h <= hue_boost_range[1]:
         s *= hue_range_sat_mult
     s = max(0.0, min(1.0, s))
 
-    # For movie mode: slight gamma adjust to preserve color mood
     if mode == Modes.MOVIE:
         v = v ** 0.9
 
     r, g, b = colorsys.hsv_to_rgb(h, s, v)
 
-    # Apply per-channel gain
-    r *= get_tunable("GAIN_R")
-    g *= get_tunable("GAIN_G")
-    b *= get_tunable("GAIN_B")
+    # Per-channel gain
+    r *= get_tunable("GAIN_R", mode)
+    g *= get_tunable("GAIN_G", mode)
+    b *= get_tunable("GAIN_B", mode)
 
-    # Clip to [0..1]
-    r = max(0.0, min(1.0, r))
-    g = max(0.0, min(1.0, g))
-    b = max(0.0, min(1.0, b))
+    # Clip and convert to 0..255
+    r = max(0.0, min(1.0, r)); g = max(0.0, min(1.0, g)); b = max(0.0, min(1.0, b))
+    return int(r * 255), int(g * 255), int(b * 255), v
 
-    return int(r*255), int(g*255), int(b*255), v
+# -------------------
+# Fast capture + average routines (mss + numpy)
+# -------------------
+sct = mss.mss()
+monitor = sct.monitors[1]  # primary full screen
 
-def ema(prev, cur, alpha):
-    return int(prev*alpha + cur*(1-alpha))
+def _subsample(img_np, target_w, target_h):
+    """Return coarse subsample roughly target_w x target_h using strides."""
+    h, w = img_np.shape[:2]
+    step_x = max(1, w // target_w)
+    step_y = max(1, h // target_h)
+    return img_np[::step_y, ::step_x]
 
-print(f"Starting Ambilight in {MODE} mode. Ctrl+C to stop.")
-last_r = last_g = last_b = 0
-try:
-    while True:
-        r, g, b, v = get_screen_avg_rgb(MODE)
+def get_screen_linear_avg(mode, prev_lin=None):
+    """
+    Returns (r_lin_mean, g_lin_mean, b_lin_mean, brightness_v)
+    - r/g/b are in linear space (0..1)
+    - prev_lin: tuple of previous linear means (for gaming temporal boost), or None
+    """
+    cap_w = get_tunable("CAPTURE_W", mode)
+    cap_h = get_tunable("CAPTURE_H", mode)
 
-        # Smooth to reduce flicker
-        if last_r == last_g == last_b == 0:
-            sr, sg, sb = r, g, b
-        else:
-            ema_alpha = get_tunable("EMA_ALPHA")
-            sr = ema(last_r, r, ema_alpha)
-            sg = ema(last_g, g, ema_alpha)
-            sb = ema(last_b, b, ema_alpha)
+    sw, sh = monitor["width"], monitor["height"]
 
-        # Map brightness from screen value; keep some floor so colors stay visible
-        brightness = int(60 + 195 * v)  # 60..255
-        if MODE==Modes.GAMING:
-            brightness = int(100 + 155 * v)  # more aggressive brightness
+    if mode == Modes.GAMING:
+        # center 25% region
+        left = int(sw * 0.375); top = int(sh * 0.375)
+        right = int(sw * 0.625); bottom = int(sh * 0.625)
+        region = {"left": left, "top": top, "width": right - left, "height": bottom - top}
+        img = sct.grab(region)
+        img_np = np.array(img)[:, :, :3]   # BGRA -> BGR
 
+        # coarse subsample: CAPTURE_W/H small (e.g. 16) => keeps reactiveness
+        img_small = _subsample(img_np, cap_w, cap_h)
 
-        send_wiz_color(sr, sg, sb, brightness=brightness)
-        last_r, last_g, last_b = sr, sg, sb
-        time.sleep(get_tunable("FRAME_DELAY_SEC"))
-except KeyboardInterrupt:
-    pass
+        # Normalize to [0..1], convert to linear
+        img_norm = img_small.astype(np.float32) / 255.0
+        # Note: channels in img_np are B, G, R
+        r_lin_map = srgb_to_linear(img_norm[:, :, 2])
+        g_lin_map = srgb_to_linear(img_norm[:, :, 1])
+        b_lin_map = srgb_to_linear(img_norm[:, :, 0])
+
+        # Mild center weighting to emphasize middle of crop (gaming focus)
+        h, w = r_lin_map.shape
+        yy, xx = np.ogrid[:h, :w]
+        cx, cy = w // 2, h // 2
+        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        max_dist = np.sqrt(cx ** 2 + cy ** 2) if (cx or cy) else 1.0
+        weights = 1.2 - (dist / max_dist)          # center ~1.2, edges lower
+        weights = np.clip(weights, 0.0, None)
+
+        # Weighted mean
+        sum_w = weights.sum()
+        r_lin = (r_lin_map * weights).sum() / sum_w
+        g_lin = (g_lin_map * weights).sum() / sum_w
+        b_lin = (b_lin_map * weights).sum() / sum_w
+
+        # Temporal boost (make gaming more reactive): blend with prev_lin if provided
+        # alpha closer to 1 => more reactive (favor new frame). tune in TWEAKS? we'll use a fixed reactive alpha.
+        reactive_alpha = 0.75  # high -> more reactive; lower -> smoother
+        if prev_lin is not None:
+            pr, pg, pb = prev_lin
+            r_lin = reactive_alpha * r_lin + (1 - reactive_alpha) * pr
+            g_lin = reactive_alpha * g_lin + (1 - reactive_alpha) * pg
+            b_lin = reactive_alpha * b_lin + (1 - reactive_alpha) * pb
+
+    elif mode == Modes.MOVIE:
+        # full-screen weighted radial average (center contributes more)
+        img = sct.grab({"left": 0, "top": 0, "width": sw, "height": sh})
+        img_np = np.array(img)[:, :, :3]
+        img_small = _subsample(img_np, cap_w, cap_h)
+        img_norm = img_small.astype(np.float32) / 255.0
+
+        r_lin_map = srgb_to_linear(img_norm[:, :, 2])
+        g_lin_map = srgb_to_linear(img_norm[:, :, 1])
+        b_lin_map = srgb_to_linear(img_norm[:, :, 0])
+
+        h, w = r_lin_map.shape
+        yy, xx = np.ogrid[:h, :w]
+        cx, cy = w // 2, h // 2
+        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        max_dist = np.sqrt(cx ** 2 + cy ** 2) if (cx or cy) else 1.0
+        # stronger center weight for movie
+        weights = 1.6 - (dist / max_dist)           # center ~1.6
+        weights = np.clip(weights, 0.0, None)
+
+        sum_w = weights.sum()
+        r_lin = (r_lin_map * weights).sum() / sum_w
+        g_lin = (g_lin_map * weights).sum() / sum_w
+        b_lin = (b_lin_map * weights).sum() / sum_w
+
+    else:  # ambient - flat full-screen average
+        img = sct.grab({"left": 0, "top": 0, "width": sw, "height": sh})
+        img_np = np.array(img)[:, :, :3]
+        img_small = _subsample(img_np, cap_w, cap_h)
+        img_norm = img_small.astype(np.float32) / 255.0
+
+        r_lin = srgb_to_linear(img_norm[:, :, 2]).mean()
+        g_lin = srgb_to_linear(img_norm[:, :, 1]).mean()
+        b_lin = srgb_to_linear(img_norm[:, :, 0]).mean()
+
+    # Return linear-space means and an approximate brightness (from linear->sRGB -> HSV later)
+    return r_lin, g_lin, b_lin
+
+# Simple EMA for integer smoothing (0..255)
+def ema_int(prev, cur, alpha):
+    return int(prev * alpha + cur * (1 - alpha))
+
+# -------------------
+# Main loop
+# -------------------
+def main(args):
+    mode = args.mode
+    # Shared state
+    last_r = last_g = last_b = 0  # last sent 0..255 values (for EMA smoothing)
+    last_lin = None                # last linear triple for gaming temporal boost
+
+    print(f"Starting Ambilight in {mode} mode. Ctrl+C to stop.")
+    try:
+        while True:
+            # Get linear-space averages (may use last_lin for gaming reactivity)
+            r_lin, g_lin, b_lin = get_screen_linear_avg(mode, prev_lin=last_lin)
+
+            # Save current linear for next iteration (used only for gaming)
+            last_lin = (r_lin, g_lin, b_lin)
+
+            # Convert to final RGB (0..255) and brightness v
+            r8, g8, b8, v = postprocess_from_linear(r_lin, g_lin, b_lin, mode)
+
+            # Final EMA smoothing on 0..255 values to reduce flicker
+            if last_r == last_g == last_b == 0:
+                sr, sg, sb = r8, g8, b8
+            else:
+                ema_alpha = get_tunable("EMA_ALPHA", mode)
+                sr = ema_int(last_r, r8, ema_alpha)
+                sg = ema_int(last_g, g8, ema_alpha)
+                sb = ema_int(last_b, b8, ema_alpha)
+
+            # Brightness mapping
+            brightness = int(60 + 195 * v)
+            if mode == Modes.GAMING:
+                brightness = int(100 + 155 * v)
+
+            # Send
+            send_wiz_color(sr, sg, sb, brightness=brightness)
+
+            # Update last
+            last_r, last_g, last_b = sr, sg, sb
+
+            # Sleep per-mode
+            time.sleep(get_tunable("FRAME_DELAY_SEC", mode))
+    except KeyboardInterrupt:
+        print("Stopping Ambilight.")
+
+# -------------------
+# CLI and run
+# -------------------
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=[Modes.AMBIENT, Modes.GAMING, Modes.MOVIE],
+                   default=Modes.GAMING, help="Operating mode")
+    args = p.parse_args()
+    main(args)

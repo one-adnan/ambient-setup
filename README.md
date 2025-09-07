@@ -2,7 +2,7 @@
 
 This project turns your **Philips WiZ smart bulb** into an **ambient light source** that syncs in real-time with your screen. It captures your display’s colors and brightness, processes them for natural and vivid lighting, and sends them to your bulb via UDP.  
 
-Currently supports **Philips WiZ bulbs**, tested on **Windows** and **macOS (M1)**. Linux support will be added soon.
+Currently supports **Philips WiZ bulbs**, tested on **Windows** and **macOS** and **Linux**.
 
 ---
 
@@ -22,16 +22,25 @@ Make sure you have Python **3.9+** installed.
 - Replace it in the script:  
 `BULB_IP = "192.168.X.X"   # <-- set your smart bulb's IP`
 
+### 4. Run the script
+
+Simply run:  
+`python ambient.py --mode gaming`  
+Or on Mac/Linux:  
+`python3 ambient.py --mode gaming`  
+
+Stop anytime with `Ctrl+C`.
+
 ---
 
 ## 🎮 Modes
 
-Choose the mode by editing:  
-`MODE = Modes.GAMING   # or Modes.AMBIENT / Modes.MOVIE`  
-
 - **Ambient** → Full-screen average color, smooth transitions. Best for casual desktop use and relaxed mood lighting.  
+`python ambient.py --mode ambient`  
 - **Gaming** → Focuses on the **center of the screen** for more reactive colors. High FPS (~30 fps) and lower smoothing for faster response.  
+`python ambient.py --mode gaming`  
 - **Movie** → Weighted average, center pixels contribute more. Keeps the mood natural with slight gamma correction.  
+`python ambient.py --mode movie`  
 
 ---
 
@@ -50,23 +59,12 @@ Each **mode** can override defaults in the `TWEAKS` section and better to tweak 
 
 ---
 
-## ▶️ Running
-
-Simply run:  
-`python ambient.py`  
-Or on Mac/Linux:  
-`python3 ambient.py`  
-
-Stop anytime with `Ctrl+C`.
-
----
-
 ## ✅ Current Support
 
 - ✔️ Philips WiZ bulbs (tested with multiple models)  
 - ✔️ Windows 10/11  
 - ✔️ macOS (M1, Intel not tested but should work)  
-- ❌ Linux (coming soon)  
+- ✔️ Linux  
 
 ---
 
