@@ -11,9 +11,17 @@ import time
 import argparse
 import os
 import colorsys
+import asyncio
+import sounddevice as sd
 
 import mss
 import numpy as np
+
+try:
+    from pywizlight import wizlight, PilotBuilder
+    _wizlight_available = True
+except ImportError:
+    _wizlight_available = False
 
 # -------------------
 # Networking / bulb
@@ -37,6 +45,7 @@ class Modes:
     AMBIENT = "ambient"
     GAMING = "gaming"
     MOVIE = "movie"
+    SOUND = "sound"
 
 # Global defaults
 CAPTURE_W, CAPTURE_H = 60, 34     # base downscale for ambient/movie
@@ -227,12 +236,56 @@ def get_screen_linear_avg(mode, prev_lin=None):
 def ema_int(prev, cur, alpha):
     return int(prev * alpha + cur * (1 - alpha))
 
+def freq_to_color(frequencies, spectrum):
+    low = np.mean(spectrum[(frequencies >= 20) & (frequencies < 250)])
+    mid = np.mean(spectrum[(frequencies >= 250) & (frequencies < 2000)])
+    high = np.mean(spectrum[(frequencies >= 2000) & (frequencies < 8000)])
+    total = low + mid + high + 1e-6
+    r = int((low / total) * 255)
+    g = int((mid / total) * 255)
+    b = int((high / total) * 255)
+    return (r, g, b)
+
+async def sound_mode_loop():
+    if not _wizlight_available:
+        print("pywizlight is not installed. Please install it for sound mode.")
+        return
+    bulb = wizlight(BULB_IP)
+    await bulb.turn_on(PilotBuilder(brightness=200))
+    loop = asyncio.get_running_loop()
+
+    SAMPLE_RATE = 44100
+    BLOCK_SIZE = 1024
+
+    def audio_callback(indata, frames, time_, status):
+        if status:
+            print(status)
+        spectrum = np.abs(np.fft.rfft(indata[:, 0]))
+        frequencies = np.fft.rfftfreq(len(indata), 1 / SAMPLE_RATE)
+        r, g, b = freq_to_color(frequencies, spectrum)
+        loop.call_soon_threadsafe(asyncio.create_task, bulb.turn_on(PilotBuilder(rgb=(r, g, b))))
+
+    with sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=BLOCK_SIZE):
+        print("Listening to system audio... Press Ctrl+C to stop.")
+        try:
+            await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            print("Stopped.")
+
 # -------------------
 # Main loop
 # -------------------
 def main(args):
     mode = args.mode
-    # Shared state
+    if mode == Modes.SOUND:
+        print("Starting Ambilight in sound mode. Ctrl+C to stop.")
+        try:
+            asyncio.run(sound_mode_loop())
+        except KeyboardInterrupt:
+            print("Stopped.")
+        return
+
+    # Shared state for other modes
     last_r = last_g = last_b = 0  # last sent 0..255 values (for EMA smoothing)
     last_lin = None                # last linear triple for gaming temporal boost
 
@@ -278,7 +331,7 @@ def main(args):
 # -------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=[Modes.AMBIENT, Modes.GAMING, Modes.MOVIE],
+    p.add_argument("--mode", choices=[Modes.AMBIENT, Modes.GAMING, Modes.MOVIE, Modes.SOUND],
                    default=Modes.GAMING, help="Operating mode")
     args = p.parse_args()
     main(args)

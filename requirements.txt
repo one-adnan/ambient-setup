@@ -1,2 +1,4 @@
 mss>=10.0.0
 numpy>=1.21.0,<2.0.0
+sounddevice>=0.4.6
+pywizlight>=0.5.10
