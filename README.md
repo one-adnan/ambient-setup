@@ -15,7 +15,7 @@ Currently supports **Philips WiZ bulbs**, tested on **Windows**, **macOS** and *
 
 ### 2. Install dependencies
 
-Make sure you have Python **3.9+** installed. [Download Python](https://www.python.org/downloads/)
+Make sure you have Python **3.9+** installed. [Download Python](https://www.python.org/downloads/)  
 `pip install -r requirements.txt`
 
 ### 3. Run the script
@@ -63,9 +63,8 @@ Each **mode** can override defaults in the `TWEAKS` section and better to tweak 
 
 ---
 
-## ✅ Current Support
+## ✅ Supported Platforms
 
-- ✔️ Philips WiZ bulbs (tested with multiple models)
 - ✔️ Windows
 - ✔️ macOS
 - ✔️ Linux
@@ -86,3 +85,4 @@ Effectively, your bulb **mimics the mood of your screen**, whether you’re brow
 ---
 
 💡 Enjoy immersive lighting that reacts to your screen in real-time!
+
