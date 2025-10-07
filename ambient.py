@@ -11,9 +11,11 @@ import time
 import argparse
 import os
 import colorsys
+import sys
 
 import mss
 import numpy as np
+import discover
 
 # -------------------
 # Networking / bulb
@@ -236,7 +238,7 @@ def main(args):
     last_r = last_g = last_b = 0  # last sent 0..255 values (for EMA smoothing)
     last_lin = None                # last linear triple for gaming temporal boost
 
-    print(f"Starting Ambilight in {mode} mode. Ctrl+C to stop.")
+    print(f"Starting Ambilight in {mode} mode. ctrl + c to stop.")
     try:
         while True:
             # Get linear-space averages (may use last_lin for gaming reactivity)
@@ -277,6 +279,15 @@ def main(args):
 # CLI and run
 # -------------------
 if __name__ == "__main__":
+    if BULB_IP == "192.168.X.X":
+        print("Trying to discover wiz bulbs in the network...")
+        devices = discover.run_discover()
+        if len(devices) > 0:
+            BULB_IP = devices[0]['ip']
+            print(f"Discovered wiz bulb at {BULB_IP}")
+        else:
+            print("Failed to auto-discover wiz bulbs. Please set BULB_IP in the script or try running again.")
+            sys.exit(1)
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=[Modes.AMBIENT, Modes.GAMING, Modes.MOVIE],
                    default=Modes.GAMING, help="Operating mode")
