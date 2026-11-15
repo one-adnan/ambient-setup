@@ -1,0 +1,6 @@
+__pycache__/
+bulbs.json
+settings.json
+build/
+dist/
+*.spec

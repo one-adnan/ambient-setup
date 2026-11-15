@@ -1,295 +1,618 @@
 """
-Ambilight (mss + numpy) - optimized, mode-aware, cross-platform (windows,mac & linux supported).
+Ambilight for WiZ bulbs (mss + numpy) - preset-based, multi-bulb, cross-platform (windows, mac & linux).
+
 Usage:
-    python ambient.py            # uses MODE default in file
-    python ambient.py --mode movie
+    python app.py                         # simple desktop app (recommended)
+    python ambient.py                     # command line: saved setup -> discovery -> setup wizard
+    python ambient.py --mode movie        # pick a preset (see PRESETS below)
+    python ambient.py --setup             # re-discover bulbs and choose their screen positions
+    python ambient.py --bulb 192.168.1.20:left --bulb 192.168.1.21:right   # skip discovery
 """
 
-import socket
-import json
-import time
 import argparse
-import os
 import colorsys
+import json
+import os
+import socket
 import sys
+import threading
+import time
+from functools import lru_cache
 
 import mss
 import numpy as np
 import discover
 
 # -------------------
-# Networking / bulb
+# Files
 # -------------------
-BULB_IP = "192.168.X.X"   # <-- set your smart bulb's IP
+if getattr(sys, "frozen", False):          # packaged app (PyInstaller): keep files next to the .exe
+    APP_DIR = os.path.dirname(sys.executable)
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(APP_DIR, "bulbs.json")       # bulbs + their positions
+SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")  # last preset, monitor, your fine-tuning
+
+# Optional manual override for the command line (skips discovery), e.g.
+# MANUAL_BULBS = [("192.168.1.20", "left"), ("192.168.1.21", "right")]
+MANUAL_BULBS = []
+
+# -------------------
+# Networking / bulbs
+# -------------------
 PORT = 38899
+_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-def send_wiz_color(r, g, b, brightness=255):
-    msg = {"method":"setState","id":1,
-           "params":{"state":True,"r":int(r),"g":int(g),"b":int(b),"dimming":int(brightness)}}
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def _send(ip, params):
+    msg = {"method": "setState", "id": 1, "params": params}
     try:
-        sock.sendto(json.dumps(msg).encode("utf-8"), (BULB_IP, PORT))
-    finally:
-        sock.close()
+        _sock.sendto(json.dumps(msg).encode("utf-8"), (ip, PORT))
+    except OSError:
+        pass
 
-# -------------------
-# Modes & tunables
-# -------------------
-class Modes:
-    AMBIENT = "ambient"
-    GAMING = "gaming"
-    MOVIE = "movie"
+def send_wiz_color(ip, r, g, b, dimming=100):
+    """WiZ uses r/g/b as a colour *mix*; brightness comes only from dimming (10..100)."""
+    dimming = max(10, min(100, int(round(dimming))))
+    _send(ip, {"state": True, "r": int(r), "g": int(g), "b": int(b), "dimming": dimming})
 
-# Global defaults
-CAPTURE_W, CAPTURE_H = 60, 34     # base downscale for ambient/movie
-FRAME_DELAY_SEC = 0.08            # ~12.5 fps default
-SAT_BOOST = 1.2
-EMA_ALPHA = 0.65
+def send_wiz_off(ip):
+    _send(ip, {"state": False})
 
-HUE_BOOST_RANGE = (0.12, 0.45)
-HUE_RANGE_SAT_MULT = 1.12
+def identify_bulb(ip, all_ips=()):
+    """Light one bulb green and switch the others off, so the user can tell which is which."""
+    for _ in range(3):  # UDP can drop packets; repeat
+        for other in all_ips:
+            if other != ip:
+                send_wiz_off(other)
+        send_wiz_color(ip, 0, 255, 0, 100)
+        time.sleep(0.05)
 
-GAIN_R, GAIN_G, GAIN_B = 1.1, 1.0, 1.05
-
-# Per-mode overrides
-TWEAKS = {
-    Modes.AMBIENT: {
-        "FRAME_DELAY_SEC": 0.08,
-        "EMA_ALPHA": 0.65,
-        "CAPTURE_W": 60,
-        "CAPTURE_H": 34,
-    },
-    Modes.GAMING: {
-        "FRAME_DELAY_SEC": 0.03, # faster updates
-        "EMA_ALPHA": 0.30,       # final smoothing on 0-255
-        "CAPTURE_W": 16,        # coarse grid -> more reactive
-        "CAPTURE_H": 16,
-        # additional internal tuning applied in code: coarse sampling + temporal boost
-    },
-    Modes.MOVIE: {
-        "FRAME_DELAY_SEC": 0.08,
-        "EMA_ALPHA": 0.65,
-        "CAPTURE_W": 48,
-        "CAPTURE_H": 28,
-        "SAT_BOOST": 1.1,
-    },
+# Screen regions as fractions of the screen: (x0, y0, x1, y1). "off" = don't use the bulb.
+POSITIONS = {
+    "full":         (0.0, 0.0, 1.0, 1.0),
+    "left":         (0.0, 0.0, 0.5, 1.0),
+    "right":        (0.5, 0.0, 1.0, 1.0),
+    "top":          (0.0, 0.0, 1.0, 0.5),
+    "bottom":       (0.0, 0.5, 1.0, 1.0),
+    "top-left":     (0.0, 0.0, 0.5, 0.5),
+    "top-right":    (0.5, 0.0, 1.0, 0.5),
+    "bottom-left":  (0.0, 0.5, 0.5, 1.0),
+    "bottom-right": (0.5, 0.5, 1.0, 1.0),
+    "center":       (0.25, 0.25, 0.75, 0.75),
+    "off":          None,
 }
 
 # -------------------
-# Helpers
+# Tunables & presets
 # -------------------
-def get_tunable(name, mode):
-    return TWEAKS.get(mode, {}).get(name, globals()[name])
+# Defaults for every preset. Presets below override some of these.
+DEFAULTS = {
+    "CAPTURE_W": 60, "CAPTURE_H": 34,  # downscale grid (smaller = faster, coarser)
+    "FRAME_DELAY_SEC": 0.08,           # time per update (0.08 = ~12 fps)
+    "EMA_ALPHA": 0.65,                 # smoothing: 0 = instant, 0.95 = very slow fades
+    "SAT_BOOST": 1.2,                  # colour intensity
+    "HUE_BOOST_RANGE": (0.12, 0.45),   # green/yellow hues look dull on bulbs...
+    "HUE_RANGE_SAT_MULT": 1.12,        # ...so they get this extra saturation
+    "GAIN_R": 1.2, "GAIN_G": 1.0, "GAIN_B": 1.05,  # per-channel correction, applied to
+                                                    # saturated colours only (greys stay neutral)
+    "FOCUS": 1.0,                      # centered fraction of the screen to sample (1 = whole screen)
+    "CENTER_WEIGHT": 0.0,              # 0 = flat average; higher = middle of the area counts more
+    "COLOR_WEIGHTING": 0.6,            # 0 = plain average; 1 = colour comes from bright/vivid pixels
+    "REACTIVE_ALPHA": 1.0,             # <1 blends with the previous frame before smoothing (gaming)
+    "MIN_BRIGHTNESS": 10,              # WiZ dimming range is 10..100
+    "MAX_BRIGHTNESS": 100,
+    "BRIGHTNESS_CURVE": 0.8,           # <1 = brighter mid-tones, >1 = darker
+    "DARK_LEVEL": 0.08,                # below this colour brightness, fade to DARK_COLOR (0 = off)
+    "DARK_COLOR": (255, 150, 80),      # neutral warm glow used for dark scenes
+    "LETTERBOX_CROP": False,           # ignore black bars around movies
+}
 
-# Vectorized sRGB <-> linear conversion (works on scalars & arrays)
+PRESETS = {
+    "ambient": {
+        "label": "Ambient (desktop & browsing)",
+        "description": "Whole-screen average with soft transitions. Relaxed mood lighting while you work or browse.",
+        "tips": [
+            "Lots of white web pages make the bulbs bright white. Lower 'Max brightness' if that's too much.",
+            "Increase 'Smoothness' for calmer, slower colour changes.",
+        ],
+        "settings": {},
+    },
+    "movie": {
+        "label": "Movie & TV",
+        "description": "Follows the picture, ignores black bars, and gives the middle of the screen more weight. "
+                       "Dark scenes fade to a dim warm glow instead of a coloured tint.",
+        "tips": [
+            "Use the player in fullscreen so menus and the taskbar don't affect the colour.",
+            "Dark scenes too bright or tinted? Raise 'Dark-scene cutoff'. Bulbs dim out too often? Lower it.",
+            "Colours too strong? Lower 'Colour intensity' to around 1.0.",
+            "With two bulbs on the left and right, wide shots split nicely. Keep 'Screen area used' at 100%.",
+        ],
+        "settings": {
+            "CAPTURE_W": 48, "CAPTURE_H": 28,
+            "SAT_BOOST": 1.1,
+            "CENTER_WEIGHT": 1.7,
+            "COLOR_WEIGHTING": 0.75,
+            "BRIGHTNESS_CURVE": 0.9,
+            "DARK_LEVEL": 0.12,
+            "LETTERBOX_CROP": True,
+        },
+    },
+    "gaming": {
+        "label": "Gaming (fast, centre focus)",
+        "description": "Fast updates sampled from the centre of the screen, where the action is. "
+                       "Ignores HUD elements at the edges.",
+        "tips": [
+            "Colours not matching the game? Increase 'Screen area used' (e.g. 40-60%) for better colour accuracy.",
+            "With left/right bulbs, the split happens inside the centre box. If both bulbs look the same, "
+            "increase 'Screen area used' or try the 'Gaming (wide)' preset.",
+            "Flickering in fast scenes? Raise 'Smoothness' a little (0.4-0.5).",
+            "Use borderless/windowed fullscreen. Some exclusive-fullscreen games block screen capture.",
+        ],
+        "settings": {
+            "CAPTURE_W": 16, "CAPTURE_H": 16,
+            "FRAME_DELAY_SEC": 0.03,
+            "EMA_ALPHA": 0.30,
+            "SAT_BOOST": 1.1,
+            "FOCUS": 0.25,
+            "CENTER_WEIGHT": 5.0,
+            "COLOR_WEIGHTING": 0.5,
+            "REACTIVE_ALPHA": 0.75,
+            "MIN_BRIGHTNESS": 30,
+            "DARK_LEVEL": 0.06,
+        },
+    },
+    "gaming-wide": {
+        "label": "Gaming (wide, multi-bulb)",
+        "description": "Fast like Gaming, but samples most of the screen. Best for open-world games, "
+                       "racing, and setups with left/right bulbs.",
+        "tips": [
+            "HUD or minimap colours leaking into the light? Lower 'Screen area used' a bit (e.g. 50%).",
+            "Pairs well with one bulb on each side of the screen.",
+        ],
+        "settings": {
+            "CAPTURE_W": 32, "CAPTURE_H": 20,
+            "FRAME_DELAY_SEC": 0.03,
+            "EMA_ALPHA": 0.35,
+            "SAT_BOOST": 1.15,
+            "FOCUS": 0.7,
+            "CENTER_WEIGHT": 1.5,
+            "COLOR_WEIGHTING": 0.6,
+            "REACTIVE_ALPHA": 0.75,
+            "MIN_BRIGHTNESS": 25,
+            "DARK_LEVEL": 0.06,
+        },
+    },
+    "vivid": {
+        "label": "Vivid (music videos, anime, party)",
+        "description": "Punchy, saturated colours taken from the most colourful parts of the screen. "
+                       "Quick to react.",
+        "tips": [
+            "Great with colourful content, but can feel intense for regular TV.",
+            "Lower 'Smoothness' even more for a beat-like, snappy effect.",
+        ],
+        "settings": {
+            "FRAME_DELAY_SEC": 0.05,
+            "EMA_ALPHA": 0.4,
+            "SAT_BOOST": 1.5,
+            "COLOR_WEIGHTING": 0.9,
+            "BRIGHTNESS_CURVE": 0.7,
+            "DARK_LEVEL": 0.1,
+        },
+    },
+    "relax": {
+        "label": "Relax (dim & slow)",
+        "description": "Dim, gentle and very slow. Background light that follows the screen's mood "
+                       "without drawing attention.",
+        "tips": [
+            "Good for reading, late-night browsing or sleepy shows.",
+            "Raise 'Max brightness' if the room feels too dark.",
+        ],
+        "settings": {
+            "FRAME_DELAY_SEC": 0.1,
+            "EMA_ALPHA": 0.92,
+            "SAT_BOOST": 0.95,
+            "COLOR_WEIGHTING": 0.4,
+            "MAX_BRIGHTNESS": 50,
+            "DARK_LEVEL": 0.1,
+        },
+    },
+}
+DEFAULT_PRESET = "gaming"
+
+def preset_settings(preset, overrides=None):
+    """DEFAULTS <- preset settings <- user overrides."""
+    s = dict(DEFAULTS)
+    s.update(PRESETS[preset]["settings"])
+    if overrides:
+        s.update({k: v for k, v in overrides.items() if k in DEFAULTS})
+    return s
+
+# -------------------
+# Colour helpers
+# -------------------
+LUMA = np.array([0.2126, 0.7152, 0.0722])
+
 def srgb_to_linear(c):
     c = np.asarray(c)
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 def linear_to_srgb(c):
-    c = np.asarray(c)
-    return np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1/2.4)) - 0.055)
+    c = np.clip(np.asarray(c, dtype=np.float64), 0.0, None)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1 / 2.4)) - 0.055)
 
-# Postprocess linear averages -> final 0..255 rgb and brightness v
-def postprocess_from_linear(r_lin, g_lin, b_lin, mode):
-    # r_lin/g_lin/b_lin are scalars in [0..1] linear space
-    # Convert to sRGB
-    r = float(linear_to_srgb(r_lin)); r = max(0.0, min(1.0, r))
-    g = float(linear_to_srgb(g_lin)); g = max(0.0, min(1.0, g))
-    b = float(linear_to_srgb(b_lin)); b = max(0.0, min(1.0, b))
+def _smoothstep(e0, e1, x):
+    if e1 <= e0:
+        return 1.0 if x >= e1 else 0.0
+    t = min(1.0, max(0.0, (x - e0) / (e1 - e0)))
+    return t * t * (3 - 2 * t)
 
-    # HSV tweak
+def finalize_color(color_lin, lum_lin, p):
+    """
+    Linear colour + linear luminance -> (r, g, b) bulb colour mix (0..255) and dimming (10..100).
+    - Colour is normalised (bulbs take r/g/b as a mix, not as brightness).
+    - Brightness is driven separately by the area's real luminance.
+    - Dark colours fade to a warm neutral glow, so near-black never turns into a random tint.
+    """
+    r, g, b = (float(x) for x in np.clip(linear_to_srgb(color_lin), 0.0, 1.0))
     h, s, v = colorsys.rgb_to_hsv(r, g, b)
-    s *= get_tunable("SAT_BOOST", mode)
-    hue_boost_range = get_tunable("HUE_BOOST_RANGE", mode)
-    hue_range_sat_mult = get_tunable("HUE_RANGE_SAT_MULT", mode)
-    if hue_boost_range[0] <= h <= hue_boost_range[1]:
-        s *= hue_range_sat_mult
+
+    s *= p["SAT_BOOST"]
+    lo, hi = p["HUE_BOOST_RANGE"]
+    if lo <= h <= hi:
+        s *= p["HUE_RANGE_SAT_MULT"]
     s = max(0.0, min(1.0, s))
 
-    if mode == Modes.MOVIE:
-        v = v ** 0.9
+    r, g, b = colorsys.hsv_to_rgb(h, s, 1.0)
+    # Channel gains only for saturated colours, so greys/whites stay neutral
+    r *= 1 + (p["GAIN_R"] - 1) * s
+    g *= 1 + (p["GAIN_G"] - 1) * s
+    b *= 1 + (p["GAIN_B"] - 1) * s
+    m = max(r, g, b) or 1.0
+    rgb = np.array([r, g, b]) / m * 255.0
 
-    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    dark = p["DARK_LEVEL"]
+    if dark > 0:
+        # narrow band: blending warm with e.g. blue gives pink, so keep the crossfade short
+        t = _smoothstep(dark * 0.8, dark * 1.2, v)
+        rgb = np.array(p["DARK_COLOR"], dtype=np.float64) * (1 - t) + rgb * t
 
-    # Per-channel gain
-    r *= get_tunable("GAIN_R", mode)
-    g *= get_tunable("GAIN_G", mode)
-    b *= get_tunable("GAIN_B", mode)
-
-    # Clip and convert to 0..255
-    r = max(0.0, min(1.0, r)); g = max(0.0, min(1.0, g)); b = max(0.0, min(1.0, b))
-    return int(r * 255), int(g * 255), int(b * 255), v
+    bright = float(linear_to_srgb(lum_lin)) ** p["BRIGHTNESS_CURVE"]
+    lo_b = max(10, p["MIN_BRIGHTNESS"])
+    hi_b = max(lo_b, min(100, p["MAX_BRIGHTNESS"]))
+    dimming = lo_b + (hi_b - lo_b) * min(1.0, bright)
+    return rgb, dimming
 
 # -------------------
-# Fast capture + average routines (mss + numpy)
+# Capture & analysis (mss + numpy)
 # -------------------
-sct = mss.mss()
-monitor = sct.monitors[1]  # primary full screen
-
 def _subsample(img_np, target_w, target_h):
-    """Return coarse subsample roughly target_w x target_h using strides."""
     h, w = img_np.shape[:2]
-    step_x = max(1, w // target_w)
-    step_y = max(1, h // target_h)
-    return img_np[::step_y, ::step_x]
+    return img_np[::max(1, h // target_h), ::max(1, w // target_w)]
 
-def get_screen_linear_avg(mode, prev_lin=None):
-    """
-    Returns (r_lin_mean, g_lin_mean, b_lin_mean, brightness_v)
-    - r/g/b are in linear space (0..1)
-    - prev_lin: tuple of previous linear means (for gaming temporal boost), or None
-    """
-    cap_w = get_tunable("CAPTURE_W", mode)
-    cap_h = get_tunable("CAPTURE_H", mode)
-
+def capture_linear(sct, monitor, p):
+    """Grab the (centered FOCUS part of the) screen; returns an HxWx3 linear-RGB array."""
     sw, sh = monitor["width"], monitor["height"]
+    focus = min(1.0, max(0.05, float(p["FOCUS"])))
+    w, h = max(1, int(sw * focus)), max(1, int(sh * focus))
+    area = {"left": monitor["left"] + (sw - w) // 2, "top": monitor["top"] + (sh - h) // 2,
+            "width": w, "height": h}
+    img_np = np.asarray(sct.grab(area))[:, :, :3]                 # BGRA -> BGR
+    small = _subsample(img_np, int(p["CAPTURE_W"]), int(p["CAPTURE_H"]))
+    return srgb_to_linear(small[:, :, ::-1].astype(np.float32) / 255.0)   # -> RGB, linear
 
-    if mode == Modes.GAMING:
-        # center 25% region
-        left = int(sw * 0.375); top = int(sh * 0.375)
-        right = int(sw * 0.625); bottom = int(sh * 0.625)
-        region = {"left": left, "top": top, "width": right - left, "height": bottom - top}
-        img = sct.grab(region)
-        img_np = np.array(img)[:, :, :3]   # BGRA -> BGR
+def crop_black_bars(lin, max_frac=0.25):
+    """Remove letterbox/pillarbox bars: edge rows/cols that are (almost) entirely black."""
+    h, w = lin.shape[:2]
+    lit = lin.max(axis=2) > 0.006                # brighter than ~sRGB 20/255
+    row_dark = lit.mean(axis=1) < 0.05           # tolerate a few lit pixels (logos, noise)
+    col_dark = lit.mean(axis=0) < 0.05
+    if row_dark.all():
+        return lin                               # fully black frame: nothing to crop
 
-        # coarse subsample: CAPTURE_W/H small (e.g. 16) => keeps reactiveness
-        img_small = _subsample(img_np, cap_w, cap_h)
+    def run(flags, limit):
+        n = 0
+        while n < limit and flags[n]:
+            n += 1
+        return n
 
-        # Normalize to [0..1], convert to linear
-        img_norm = img_small.astype(np.float32) / 255.0
-        # Note: channels in img_np are B, G, R
-        r_lin_map = srgb_to_linear(img_norm[:, :, 2])
-        g_lin_map = srgb_to_linear(img_norm[:, :, 1])
-        b_lin_map = srgb_to_linear(img_norm[:, :, 0])
+    top, bottom = run(row_dark, int(h * max_frac)), run(row_dark[::-1], int(h * max_frac))
+    left, right = run(col_dark, int(w * max_frac)), run(col_dark[::-1], int(w * max_frac))
+    return lin[top:h - bottom, left:w - right]
 
-        # Mild center weighting to emphasize middle of crop (gaming focus)
-        h, w = r_lin_map.shape
-        yy, xx = np.ogrid[:h, :w]
-        cx, cy = w // 2, h // 2
-        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-        max_dist = np.sqrt(cx ** 2 + cy ** 2) if (cx or cy) else 1.0
-        weights = 1.2 - (dist / max_dist)          # center ~1.2, edges lower
-        weights = np.clip(weights, 0.0, None)
+@lru_cache(maxsize=16)
+def _radial_weights(h, w, center_weight):
+    """1 at the corners, rising to 1 + center_weight in the middle."""
+    yy, xx = np.ogrid[:h, :w]
+    cx, cy = (w - 1) / 2, (h - 1) / 2
+    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    max_dist = np.sqrt(cx ** 2 + cy ** 2) or 1.0
+    return 1.0 + center_weight * (1.0 - dist / max_dist)
 
-        # Weighted mean
-        sum_w = weights.sum()
-        r_lin = (r_lin_map * weights).sum() / sum_w
-        g_lin = (g_lin_map * weights).sum() / sum_w
-        b_lin = (b_lin_map * weights).sum() / sum_w
+def _vivid_weights(lin, strength):
+    """Weights favouring bright, saturated pixels so the colour comes from what's actually colourful."""
+    if strength <= 0:
+        return 1.0
+    mx = lin.max(axis=2)
+    mn = lin.min(axis=2)
+    sat = (mx - mn) / (mx + 1e-6)
+    vivid = np.sqrt(mx) * (0.2 + sat)
+    vivid = vivid / (vivid.mean() + 1e-6)
+    return (1 - strength) + strength * vivid
 
-        # Temporal boost (make gaming more reactive): blend with prev_lin if provided
-        # alpha closer to 1 => more reactive (favor new frame). tune in TWEAKS? we'll use a fixed reactive alpha.
-        reactive_alpha = 0.75  # high -> more reactive; lower -> smoother
-        if prev_lin is not None:
-            pr, pg, pb = prev_lin
-            r_lin = reactive_alpha * r_lin + (1 - reactive_alpha) * pr
-            g_lin = reactive_alpha * g_lin + (1 - reactive_alpha) * pg
-            b_lin = reactive_alpha * b_lin + (1 - reactive_alpha) * pb
+def _region_slices(h, w, region):
+    x0, y0, x1, y1 = region
+    c0 = min(int(x0 * w), w - 1); c1 = max(c0 + 1, int(round(x1 * w)))
+    r0 = min(int(y0 * h), h - 1); r1 = max(r0 + 1, int(round(y1 * h)))
+    return slice(r0, r1), slice(c0, c1)
 
-    elif mode == Modes.MOVIE:
-        # full-screen weighted radial average (center contributes more)
-        img = sct.grab({"left": 0, "top": 0, "width": sw, "height": sh})
-        img_np = np.array(img)[:, :, :3]
-        img_small = _subsample(img_np, cap_w, cap_h)
-        img_norm = img_small.astype(np.float32) / 255.0
-
-        r_lin_map = srgb_to_linear(img_norm[:, :, 2])
-        g_lin_map = srgb_to_linear(img_norm[:, :, 1])
-        b_lin_map = srgb_to_linear(img_norm[:, :, 0])
-
-        h, w = r_lin_map.shape
-        yy, xx = np.ogrid[:h, :w]
-        cx, cy = w // 2, h // 2
-        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-        max_dist = np.sqrt(cx ** 2 + cy ** 2) if (cx or cy) else 1.0
-        # stronger center weight for movie
-        weights = 1.6 - (dist / max_dist)           # center ~1.6
-        weights = np.clip(weights, 0.0, None)
-
-        sum_w = weights.sum()
-        r_lin = (r_lin_map * weights).sum() / sum_w
-        g_lin = (g_lin_map * weights).sum() / sum_w
-        b_lin = (b_lin_map * weights).sum() / sum_w
-
-    else:  # ambient - flat full-screen average
-        img = sct.grab({"left": 0, "top": 0, "width": sw, "height": sh})
-        img_np = np.array(img)[:, :, :3]
-        img_small = _subsample(img_np, cap_w, cap_h)
-        img_norm = img_small.astype(np.float32) / 255.0
-
-        r_lin = srgb_to_linear(img_norm[:, :, 2]).mean()
-        g_lin = srgb_to_linear(img_norm[:, :, 1]).mean()
-        b_lin = srgb_to_linear(img_norm[:, :, 0]).mean()
-
-    # Return linear-space means and an approximate brightness (from linear->sRGB -> HSV later)
-    return r_lin, g_lin, b_lin
-
-# Simple EMA for integer smoothing (0..255)
-def ema_int(prev, cur, alpha):
-    return int(prev * alpha + cur * (1 - alpha))
+def region_for(bulb):
+    if "region" in bulb:
+        return tuple(float(v) for v in bulb["region"])
+    return POSITIONS.get(bulb.get("position", "full"), POSITIONS["full"])
 
 # -------------------
-# Main loop
+# Engine (used by both the CLI and the app)
+# -------------------
+class Engine:
+    """
+    Runs the capture -> colour -> bulbs loop. Preset, overrides and bulbs can be changed live
+    (just assign the attributes) while run() is going in another thread.
+    on_frame(list of (ip, (r, g, b), dimming)) is called after every update.
+    """
+
+    def __init__(self, bulbs, preset=DEFAULT_PRESET, overrides=None, monitor=1, on_frame=None):
+        self.bulbs = list(bulbs)
+        self.preset = preset
+        self.overrides = dict(overrides or {})
+        self.monitor = monitor
+        self.on_frame = on_frame
+        self._stop = threading.Event()
+        self._state = {}   # ip -> per-bulb smoothing state
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        with mss.mss() as sct:   # mss must be created in the thread that uses it
+            if not 1 <= self.monitor < len(sct.monitors):
+                raise ValueError(f"Monitor {self.monitor} not found (available: 1..{len(sct.monitors) - 1}).")
+            monitor = sct.monitors[self.monitor]
+            while not self._stop.is_set():
+                started = time.monotonic()
+                p = preset_settings(self.preset, self.overrides)
+                frame = self._update(sct, monitor, p)
+                if self.on_frame:
+                    self.on_frame(frame)
+                self._stop.wait(max(0.0, p["FRAME_DELAY_SEC"] - (time.monotonic() - started)))
+
+    def _update(self, sct, monitor, p):
+        lin = capture_linear(sct, monitor, p)
+        if p["LETTERBOX_CROP"]:
+            lin = crop_black_bars(lin)
+        h, w = lin.shape[:2]
+
+        cw = float(p["CENTER_WEIGHT"])
+        base = _radial_weights(h, w, cw) if cw > 0 else np.ones((h, w))
+        lum = lin @ LUMA
+        color_w = base * _vivid_weights(lin, float(p["COLOR_WEIGHTING"]))
+
+        results = []
+        for bulb in list(self.bulbs):
+            region = region_for(bulb)
+            if region is None:   # position "off"
+                continue
+            rows, cols = _region_slices(h, w, region)
+
+            bw = base[rows, cols]
+            lum_mean = float((lum[rows, cols] * bw).sum() / bw.sum())
+            wts = color_w[rows, cols]
+            total = wts.sum()
+            patch = lin[rows, cols]
+            if total > 0:
+                color = (patch * wts[..., None]).sum(axis=(0, 1)) / total
+            else:
+                color = patch.reshape(-1, 3).mean(axis=0)
+
+            st = self._state.setdefault(bulb["ip"], {"lin": None, "out": None})
+            ra = p["REACTIVE_ALPHA"]
+            if ra < 1 and st["lin"] is not None:
+                color = ra * color + (1 - ra) * st["lin"]
+            st["lin"] = color
+
+            rgb, dimming = finalize_color(color, lum_mean, p)
+            target = np.array([rgb[0], rgb[1], rgb[2], dimming])
+            a = p["EMA_ALPHA"]
+            st["out"] = target if st["out"] is None else a * st["out"] + (1 - a) * target
+
+            r, g, b, d = st["out"]
+            send_wiz_color(bulb["ip"], round(r), round(g), round(b), d)
+            results.append((bulb["ip"], (int(r), int(g), int(b)), int(round(d))))
+        return results
+
+# -------------------
+# Config files
+# -------------------
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError) as e:
+        print(f"Could not read {path} ({e}); ignoring it.")
+        return None
+
+def _write_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def load_config():
+    data = _read_json(CONFIG_PATH)
+    return data.get("bulbs", []) if isinstance(data, dict) else None
+
+def save_config(bulbs, quiet=False):
+    clean = [{k: v for k, v in b.items() if not k.startswith("_")} for b in bulbs]
+    _write_json(CONFIG_PATH, {"bulbs": clean})
+    if not quiet:
+        print(f"Saved bulb setup to {CONFIG_PATH}")
+
+def load_settings():
+    data = _read_json(SETTINGS_PATH)
+    data = data if isinstance(data, dict) else {}
+    data.setdefault("preset", DEFAULT_PRESET)
+    if data["preset"] not in PRESETS:
+        data["preset"] = DEFAULT_PRESET
+    data.setdefault("monitor", 1)
+    data.setdefault("overrides", {})
+    return data
+
+def save_settings(settings):
+    _write_json(SETTINGS_PATH, settings)
+
+# -------------------
+# Bulb discovery & CLI setup wizard
+# -------------------
+def resolve_saved(saved, log=print):
+    """Check saved bulbs still answer at their IP; re-discover by MAC if any moved."""
+    answered = discover.probe([b["ip"] for b in saved])
+    missing = [b for b in saved if b.get("mac", "").lower() not in answered]
+    if missing:
+        log(f"{len(missing)} saved bulb(s) did not answer at their last IP, re-discovering...")
+        for d in discover.discover(expected=len(saved)):
+            answered.setdefault(d["mac"], d)
+
+    resolved, changed = [], False
+    for b in saved:
+        dev = answered.get(b.get("mac", "").lower())
+        if dev:
+            if dev["ip"] != b["ip"]:
+                log(f"  bulb {b['mac']} moved {b['ip']} -> {dev['ip']}")
+                b["ip"] = dev["ip"]
+                changed = True
+            resolved.append(b)
+        else:
+            log(f"  WARNING: bulb {b.get('mac')} ({b.get('position', 'full')}) not found, skipping it.")
+    if changed:
+        save_config(saved, quiet=True)
+    return resolved
+
+def merge_discovered(saved, devices):
+    """Combine saved bulbs (keeping positions) with freshly discovered ones."""
+    saved = saved or []
+    by_mac = {b.get("mac", "").lower(): b for b in saved}
+    defaults = {1: ["full"], 2: ["left", "right"]}.get(len(devices), ["full"] * len(devices))
+    merged = []
+    for i, d in enumerate(devices):
+        b = by_mac.get(d["mac"])
+        if b:
+            b.update(ip=d["ip"], name=d.get("name", b.get("name", "")))
+        else:
+            b = {"mac": d["mac"], "ip": d["ip"], "name": d.get("name", ""), "position": defaults[i]}
+        merged.append(b)
+    return merged
+
+def _parse_position(ans, default):
+    names = list(POSITIONS)
+    if ans == "":
+        return default
+    if ans in ("s", "skip"):
+        return "off"
+    if ans.isdigit() and 1 <= int(ans) <= len(names):
+        return names[int(ans) - 1]
+    return ans if ans in POSITIONS else None
+
+def setup_wizard(devices):
+    """Light up each bulb in turn and ask where it sits relative to the screen."""
+    names = list(POSITIONS)
+    bulbs = merge_discovered(load_config(), devices)
+    print(f"\nPosition setup: {len(bulbs)} bulb(s). Each bulb will light up GREEN in turn.")
+    print("Positions: " + "  ".join(f"{i}={n}" for i, n in enumerate(names, 1)) + "  s=skip")
+
+    all_ips = [b["ip"] for b in bulbs]
+    for i, b in enumerate(bulbs):
+        identify_bulb(b["ip"], all_ips)
+        default = b.get("position", "full")
+        while True:
+            prompt = f"[{i + 1}/{len(bulbs)}] Bulb {b['ip']} is GREEN. Where is it? [Enter={default}]: "
+            try:
+                choice = _parse_position(input(prompt).strip().lower(), default)
+            except EOFError:
+                choice = default
+            if choice:
+                break
+            print("  Unknown position, enter a number or name from the list.")
+        b["position"] = choice
+        if choice == "off":
+            send_wiz_off(b["ip"])
+
+    save_config(bulbs)
+    return bulbs
+
+def parse_bulb_arg(s):
+    ip, _, pos = s.partition(":")
+    pos = pos or "full"
+    if pos not in POSITIONS:
+        raise argparse.ArgumentTypeError(f"unknown position '{pos}', choose from: {', '.join(POSITIONS)}")
+    return {"ip": ip, "position": pos}
+
+def get_bulbs(args):
+    if args.bulb:
+        return args.bulb
+    if MANUAL_BULBS:
+        return [{"ip": ip, "position": pos} for ip, pos in MANUAL_BULBS]
+
+    saved = None if args.setup else load_config()
+    if saved:
+        return resolve_saved(saved)
+
+    print("Searching for WiZ bulbs on the network...")
+    devices = discover.discover(verbose=True)
+    for d in devices:
+        print(f"  found {d['ip']:<15} mac={d['mac']} {d['name']}")
+    if not devices:
+        return []
+    if args.setup or (len(devices) > 1 and sys.stdin.isatty()):
+        return setup_wizard(devices)
+    bulbs = merge_discovered(None, devices)
+    if len(devices) > 1:
+        print("Multiple bulbs found; using left/right/full defaults. Run with --setup to change positions.")
+    save_config(bulbs)
+    return bulbs
+
+# -------------------
+# CLI
 # -------------------
 def main(args):
-    mode = args.mode
-    # Shared state
-    last_r = last_g = last_b = 0  # last sent 0..255 values (for EMA smoothing)
-    last_lin = None                # last linear triple for gaming temporal boost
+    settings = load_settings()
+    preset = args.mode or settings["preset"]
+    monitor = args.monitor or settings["monitor"]
 
-    print(f"Starting Ambilight in {mode} mode. ctrl + c to stop.")
+    bulbs = [b for b in get_bulbs(args) if region_for(b) is not None]
+    if not bulbs:
+        print("No WiZ bulbs found. Make sure this computer and the bulbs are on the same network/Wi-Fi,\n"
+              "then try again, or pass the IP directly: python ambient.py --bulb 192.168.X.X:full")
+        sys.exit(1)
+
+    print(f"Starting Ambilight with preset '{preset}' and {len(bulbs)} bulb(s):")
+    for b in bulbs:
+        print(f"  {b['ip']:<15} -> {'custom region' if 'region' in b else b.get('position', 'full')}")
+    print("ctrl + c to stop.")
+
+    engine = Engine(bulbs, preset, settings["overrides"].get(preset), monitor)
     try:
-        while True:
-            # Get linear-space averages (may use last_lin for gaming reactivity)
-            r_lin, g_lin, b_lin = get_screen_linear_avg(mode, prev_lin=last_lin)
-
-            # Save current linear for next iteration (used only for gaming)
-            last_lin = (r_lin, g_lin, b_lin)
-
-            # Convert to final RGB (0..255) and brightness v
-            r8, g8, b8, v = postprocess_from_linear(r_lin, g_lin, b_lin, mode)
-
-            # Final EMA smoothing on 0..255 values to reduce flicker
-            if last_r == last_g == last_b == 0:
-                sr, sg, sb = r8, g8, b8
-            else:
-                ema_alpha = get_tunable("EMA_ALPHA", mode)
-                sr = ema_int(last_r, r8, ema_alpha)
-                sg = ema_int(last_g, g8, ema_alpha)
-                sb = ema_int(last_b, b8, ema_alpha)
-
-            # Brightness mapping
-            brightness = int(60 + 195 * v)
-            if mode == Modes.GAMING:
-                brightness = int(100 + 155 * v)
-
-            # Send
-            send_wiz_color(sr, sg, sb, brightness=brightness)
-
-            # Update last
-            last_r, last_g, last_b = sr, sg, sb
-
-            # Sleep per-mode
-            time.sleep(get_tunable("FRAME_DELAY_SEC", mode))
+        engine.run()
     except KeyboardInterrupt:
         print("Stopping Ambilight.")
+    except ValueError as e:
+        print(e)
+        sys.exit(1)
 
-# -------------------
-# CLI and run
-# -------------------
 if __name__ == "__main__":
-    if BULB_IP == "192.168.X.X":
-        print("Trying to discover wiz bulbs in the network...")
-        devices = discover.run_discover()
-        if len(devices) > 0:
-            BULB_IP = devices[0]['ip']
-            print(f"Discovered wiz bulb at {BULB_IP}")
-        else:
-            print("Failed to auto-discover wiz bulbs. Please set BULB_IP in the script or try running again.")
-            sys.exit(1)
-    p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=[Modes.AMBIENT, Modes.GAMING, Modes.MOVIE],
-                   default=Modes.GAMING, help="Operating mode")
-    args = p.parse_args()
-    main(args)
+    p = argparse.ArgumentParser(description="Sync WiZ bulbs with your screen.")
+    p.add_argument("--mode", choices=list(PRESETS), help="Preset to use (default: last used, or gaming)")
+    p.add_argument("--setup", action="store_true",
+                   help="Re-discover bulbs and choose each bulb's position relative to the screen")
+    p.add_argument("--bulb", action="append", type=parse_bulb_arg, metavar="IP[:POSITION]",
+                   help=f"Use this bulb (repeatable), skipping discovery. Positions: {', '.join(POSITIONS)}")
+    p.add_argument("--monitor", type=int, help="Monitor number to capture (1 = primary)")
+    main(p.parse_args())
